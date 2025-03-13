@@ -1,0 +1,108 @@
+from fastapi import FastAPI, HTTPException
+import requests
+import time
+import pandas as pd
+from collections import defaultdict
+from typing import Dict
+
+app = FastAPI()
+
+# Global rate limit setup
+RATE_LIMIT = 3  # Maximum API calls per minute
+TIME_WINDOW = 60  # Time window in seconds
+request_count = defaultdict(int)
+last_reset_time = defaultdict(float)
+
+# In-memory cache for CNPJ data
+cnpj_cache: Dict[str, Dict] = {}
+
+# Function to check rate limiting
+def is_rate_limited(ip: str) -> bool:
+    global request_count, last_reset_time
+    current_time = time.time()
+
+    # Reset rate limit counter every TIME_WINDOW
+    if current_time - last_reset_time[ip] > TIME_WINDOW:
+        request_count[ip] = 0
+        last_reset_time[ip] = current_time
+
+    if request_count[ip] < RATE_LIMIT:
+        request_count[ip] += 1
+        return False
+    return True
+
+# Function to query CNPJ data from ReceitaWS API
+def fetch_cnpj_data(cnpj: str):
+    if cnpj in cnpj_cache:
+        print(f"Cache hit for CNPJ: {cnpj}")  # Debugging cache hit
+        return cnpj_cache[cnpj]
+
+    try:
+        print(f"Fetching data for CNPJ: {cnpj}")  # Debugging API request
+        response = requests.get(f"https://www.receitaws.com.br/v1/cnpj/{cnpj}")
+        if response.status_code == 200:
+            data = response.json()
+            print(f"Data fetched for CNPJ: {cnpj}")  # Debugging API success
+            cnpj_cache[cnpj] = data
+            return data
+        else:
+            print(f"Failed to fetch data for CNPJ: {cnpj}. Status code: {response.status_code}")
+            return None
+    except Exception as e:
+        print(f"Error fetching data for CNPJ: {cnpj}. Error: {e}")
+        return None
+
+# Route to query all CNPJs from an Excel file and write results next to CNPJ
+@app.post("/query_cnpjs_from_excel/")
+def query_cnpjs_from_excel(file_path: str, client_ip: str = '127.0.0.1'):
+    try:
+        # Load CNPJs from the Excel file (assuming it's in column 'CNPJ')
+        print(f"Loading Excel file from: {file_path}")  # Debugging file path
+        df = pd.read_excel(file_path)
+        print(f"Excel file loaded. Columns: {df.columns}")  # Debugging Excel loading
+        if 'CNPJ' not in df.columns:
+            raise HTTPException(status_code=400, detail="No 'CNPJ' column found in the Excel file.")
+        
+        # Create a column for storing the results
+        df['CNPJ Data'] = None
+
+        # Iterate over CNPJs and query the API
+        for index, row in df.iterrows():
+            cnpj = str(row['CNPJ']).zfill(14)  # Ensure CNPJ is in correct format
+            print(f"Processing CNPJ: {cnpj} (Row: {index})")  # Debugging row processing
+            
+            if is_rate_limited(client_ip):
+                print(f"Rate limit exceeded for IP: {client_ip}")  # Debugging rate limit
+                raise HTTPException(status_code=429, detail="Too many requests. Please wait a minute.")
+
+            data = fetch_cnpj_data(cnpj)
+            if data:
+                df.at[index, 'CNPJ Data'] = str(data)  # Save the result in the new column
+            else:
+                df.at[index, 'CNPJ Data'] = "Failed to retrieve data"
+        
+        # Save the updated dataframe back to the same Excel file
+        print(f"Saving updated Excel file to: {file_path}")  # Debugging file save
+        df.to_excel(file_path, index=False)
+        print(f"Excel file saved successfully")  # Debugging file saved
+        return {"status": "success", "output_file": file_path}
+    
+    except Exception as e:
+        print(f"Error during processing: {e}")  # Debugging exception
+        raise HTTPException(status_code=500, detail=str(e))
+
+# To run the API
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8000)
+
+import requests
+
+# Define your file path
+file_path = "path"
+
+# Make a POST request to the FastAPI server
+response = requests.post(
+    "http://127.0.0.1:8000/query_cnpjs_from_excel/",
+    json={"file_path": file_path}
+)
